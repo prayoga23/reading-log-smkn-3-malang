@@ -1,5 +1,7 @@
 <?php
-session_start();
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
 include __DIR__ . '/inc_koneksi.php';
 
 function ensure_penilaian_table($koneksi)
