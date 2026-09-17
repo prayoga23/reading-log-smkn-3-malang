@@ -1,5 +1,7 @@
 <?php
-session_start();
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
 require __DIR__ . '/inc_koneksi.php';
 
 // Check if user is logged in as guru
@@ -250,4 +252,7 @@ if (empty($top_readers)) {
     }
 }
 
+if (ob_get_length()) {
+    ob_end_clean();
+}
 $pdf->Output('I', 'Laporan_Literasi_Kelas_' . ($kelas_guru ?: 'TanpaKelas') . '.pdf');
