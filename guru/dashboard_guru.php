@@ -877,7 +877,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             });
 
             // Kirim data ke backend
-            fetch('/save_penilaian.php', {
+            fetch('../save_penilaian.php', {
                 method: 'POST',
                 headers: {
                     'Accept': 'application/json',
@@ -890,6 +890,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                 try {
                     return JSON.parse(text);
                 } catch (error) {
+                    console.error('Response error:', text);
                     throw new Error('Response simpan penilaian bukan JSON valid.');
                 }
             })
@@ -897,6 +898,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                 if (data.success) {
                     alert(data.message || 'Penilaian berhasil disimpan!');
                     closeModal();
+                    location.reload();
                 } else {
                     alert('Gagal menyimpan penilaian: ' + data.message);
                 }
