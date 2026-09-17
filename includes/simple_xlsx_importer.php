@@ -9,24 +9,142 @@
 class SimpleXlsxImporter
 {
     /**
-     * Membaca file .xlsx dan mengembalikan array: sheetName => rows => columns
+     * Membaca seluruh file dalam archive ZIP/XLSX
+     * Mendukung fallback otomatis jika ekstensi ZipArchive tidak terinstall di server PHP
      */
-    public static function parseXlsx(string $filePath): array
+    public static function readZipEntries(string $filePath): array
     {
         if (!file_exists($filePath)) {
             throw new Exception("File tidak ditemukan: " . htmlspecialchars($filePath));
         }
 
-        $zip = new ZipArchive();
-        if ($zip->open($filePath) !== true) {
-            throw new Exception("Tidak dapat membuka file Excel (.xlsx). Pastikan format file valid.");
+        // 1. Coba ZipArchive jika ekstensi tersedia
+        if (class_exists('ZipArchive')) {
+            $zip = new ZipArchive();
+            if ($zip->open($filePath) === true) {
+                $entries = [];
+                for ($i = 0; $i < $zip->numFiles; $i++) {
+                    $name = ltrim(str_replace('\\', '/', $zip->getNameIndex($i)), '/');
+                    $entries[$name] = $zip->getFromIndex($i);
+                }
+                $zip->close();
+                return $entries;
+            }
         }
+
+        // 2. Fallback: Pure-PHP PKZIP Central Directory Reader (menggunakan gzinflate bawaan PHP core)
+        $fp = @fopen($filePath, 'rb');
+        if (!$fp) {
+            throw new Exception("Gagal membuka file Excel: " . htmlspecialchars($filePath));
+        }
+
+        // Cari End of Central Directory Record (EOCD signature: PK\x05\x06)
+        fseek($fp, 0, SEEK_END);
+        $fileSize = ftell($fp);
+        $searchLen = min($fileSize, 65557);
+        fseek($fp, $fileSize - $searchLen);
+        $data = fread($fp, $searchLen);
+
+        $eocdPos = strrpos($data, "PK\x05\x06");
+        if ($eocdPos !== false) {
+            $eocd = unpack('vdisk/vcd_disk/vdisk_entries/vtotal_entries/Vcd_size/Vcd_offset/vcomment_len', substr($data, $eocdPos + 4, 18));
+            fseek($fp, $eocd['cd_offset']);
+            $entries = [];
+
+            for ($i = 0; $i < $eocd['total_entries']; $i++) {
+                $sig = fread($fp, 4);
+                if ($sig !== "PK\x01\x02") {
+                    break;
+                }
+                $cd = unpack('vversion/vversion_needed/vflag/vmethod/vmodtime/vmoddate/Vcrc/Vcsize/Vusize/vnamelen/vextralen/vcommentlen/vdisk_start/vint_attr/Vext_attr/Vlocal_offset', fread($fp, 42));
+                $name = fread($fp, $cd['namelen']);
+                if ($cd['extralen'] > 0) fseek($fp, $cd['extralen'], SEEK_CUR);
+                if ($cd['commentlen'] > 0) fseek($fp, $cd['commentlen'], SEEK_CUR);
+
+                $nameNorm = ltrim(str_replace('\\', '/', $name), '/');
+
+                // Baca data dari local header
+                $curPos = ftell($fp);
+                fseek($fp, $cd['local_offset']);
+                $locSig = fread($fp, 4);
+                if ($locSig === "PK\x03\x04") {
+                    $loc = unpack('vversion/vflag/vmethod/vmodtime/vmoddate/Vcrc/Vcsize/Vusize/vnamelen/vextralen', fread($fp, 26));
+                    fseek($fp, $loc['namelen'] + $loc['extralen'], SEEK_CUR);
+                    $cdata = fread($fp, $cd['csize']);
+
+                    if ($cd['method'] == 8) {
+                        $decompressed = @gzinflate($cdata);
+                        if ($decompressed !== false) {
+                            $entries[$nameNorm] = $decompressed;
+                        }
+                    } elseif ($cd['method'] == 0) {
+                        $entries[$nameNorm] = $cdata;
+                    }
+                }
+                fseek($fp, $curPos);
+            }
+            fclose($fp);
+            if (!empty($entries)) {
+                return $entries;
+            }
+        } else {
+            fclose($fp);
+        }
+
+        // 3. Fallback: coba unzip command line jika tersedia di OS server
+        if (function_exists('shell_exec') || function_exists('exec')) {
+            $tmpDir = sys_get_temp_dir() . '/xlsx_' . uniqid();
+            @mkdir($tmpDir, 0777, true);
+            $cmd = 'unzip -q ' . escapeshellarg($filePath) . ' -d ' . escapeshellarg($tmpDir) . ' 2>&1';
+            @shell_exec($cmd);
+            if (file_exists($tmpDir . '/xl/workbook.xml')) {
+                $entries = [];
+                $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($tmpDir, FilesystemIterator::SKIP_DOTS));
+                foreach ($iterator as $item) {
+                    if ($item->isFile()) {
+                        $rel = ltrim(str_replace(['\\', $tmpDir], ['/', ''], $item->getPathname()), '/');
+                        $entries[$rel] = file_get_contents($item->getPathname());
+                    }
+                }
+                // Hapus folder sementara
+                $files = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($tmpDir, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::CHILD_FIRST);
+                foreach ($files as $f) {
+                    $f->isDir() ? @rmdir($f->getRealPath()) : @unlink($f->getRealPath());
+                }
+                @rmdir($tmpDir);
+                if (!empty($entries)) {
+                    return $entries;
+                }
+            }
+        }
+
+        throw new Exception("Tidak dapat mengekstrak file Excel (.xlsx). Pastikan file tidak rusak atau gunakan format CSV (.csv).");
+    }
+
+    /**
+     * Membaca file .xlsx dan mengembalikan array: sheetName => rows => columns
+     */
+    public static function parseXlsx(string $filePath): array
+    {
+        $zipEntries = self::readZipEntries($filePath);
+
+        // Helper untuk mencari file entry dengan variasi path
+        $getEntry = function(string $path) use (&$zipEntries): ?string {
+            $pathNorm = ltrim(str_replace('\\', '/', $path), '/');
+            if (isset($zipEntries[$pathNorm])) {
+                return $zipEntries[$pathNorm];
+            }
+            if (strpos($pathNorm, 'xl/') !== 0 && isset($zipEntries['xl/' . $pathNorm])) {
+                return $zipEntries['xl/' . $pathNorm];
+            }
+            return null;
+        };
 
         // 1. Baca shared strings
         $sharedStrings = [];
-        $ssXml = $zip->getFromName('xl/sharedStrings.xml');
-        if ($ssXml !== false) {
-            $xml = simplexml_load_string($ssXml);
+        $ssXml = $getEntry('xl/sharedStrings.xml');
+        if ($ssXml) {
+            $xml = @simplexml_load_string($ssXml);
             if ($xml) {
                 foreach ($xml->si as $si) {
                     if (isset($si->t)) {
@@ -46,9 +164,9 @@ class SimpleXlsxImporter
 
         // 2. Baca relationships untuk mencocokkan rId sheet ke target file xml
         $rels = [];
-        $relsXml = $zip->getFromName('xl/_rels/workbook.xml.rels');
-        if ($relsXml !== false) {
-            $xml = simplexml_load_string($relsXml);
+        $relsXml = $getEntry('xl/_rels/workbook.xml.rels');
+        if ($relsXml) {
+            $xml = @simplexml_load_string($relsXml);
             if ($xml) {
                 foreach ($xml->Relationship as $rel) {
                     $rels[(string) $rel['Id']] = (string) $rel['Target'];
@@ -58,9 +176,9 @@ class SimpleXlsxImporter
 
         // 3. Baca nama sheet dari workbook.xml
         $sheets = [];
-        $wbXml = $zip->getFromName('xl/workbook.xml');
-        if ($wbXml !== false) {
-            $xml = simplexml_load_string($wbXml);
+        $wbXml = $getEntry('xl/workbook.xml');
+        if ($wbXml) {
+            $xml = @simplexml_load_string($wbXml);
             if ($xml && isset($xml->sheets->sheet)) {
                 foreach ($xml->sheets->sheet as $s) {
                     $sheetName = (string) $s['name'];
@@ -80,11 +198,11 @@ class SimpleXlsxImporter
         // 4. Baca data setiap sheet
         $result = [];
         foreach ($sheets as $name => $xmlPath) {
-            $sheetContent = $zip->getFromName($xmlPath);
-            if ($sheetContent === false) {
+            $sheetContent = $getEntry($xmlPath);
+            if (!$sheetContent) {
                 continue;
             }
-            $xml = simplexml_load_string($sheetContent);
+            $xml = @simplexml_load_string($sheetContent);
             if (!$xml || !isset($xml->sheetData->row)) {
                 continue;
             }
@@ -115,7 +233,6 @@ class SimpleXlsxImporter
             $result[$name] = $rows;
         }
 
-        $zip->close();
         return $result;
     }
 
@@ -375,10 +492,17 @@ class SimpleXlsxImporter
 
                 $emailUser = strtolower(preg_replace('/[^a-zA-Z0-9]+/', '.', $nama));
                 $emailUser = trim($emailUser, '.');
+                $nisSiswa = $nipd !== '' ? $nipd : ('SISWA_' . substr(md5($nama . $namaKelas), 0, 8));
                 $emailSiswa = $emailUser . '@example.com';
-                $jabatanSiswa = 'Siswa';
-                $nisSiswa = $nipd !== '' ? $nipd : ('SISWA_' . substr(md5($nama), 0, 8));
 
+                // Cegah duplikasi email jika nama sama dengan siswa lain
+                $chkEmail = $koneksi->query("SELECT id FROM users WHERE email = '" . $koneksi->real_escape_string($emailSiswa) . "' AND nis_nip != '" . $koneksi->real_escape_string($nisSiswa) . "' LIMIT 1");
+                if ($chkEmail && $chkEmail->num_rows > 0) {
+                    $suffix = preg_replace('/[^0-9a-z]/', '', $nisSiswa);
+                    $emailSiswa = $emailUser . '.' . substr($suffix, -4) . '@example.com';
+                }
+
+                $jabatanSiswa = 'Siswa';
                 $stmtUser->bind_param('sssssss', $nama, $emailSiswa, $defaultPasswordSiswa, $jabatanSiswa, $nisSiswa, $namaKelas, $jurusan);
                 if ($stmtUser->execute()) {
                     $summary['siswa_count']++;

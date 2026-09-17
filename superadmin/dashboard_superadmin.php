@@ -174,10 +174,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $mapel = bersihkan_input($_POST['jurusan'] ?? '');
         $password = $_POST['password'] ?? '';
         $is_active = isset($_POST['is_active']) ? (int) $_POST['is_active'] : 1;
+        $wali_kelas_assign = bersihkan_input($_POST['wali_kelas_assign'] ?? '');
 
-        if ($nama === '' || $email === '' || $nis_nip === '' || $kelas === '' || $mapel === '') {
-            set_flash_message('error', 'Semua field guru wajib diisi.');
+        if ($nama === '' || $email === '' || $nis_nip === '' || $mapel === '') {
+            set_flash_message('error', 'Nama, email, NIP, dan mata pelajaran wajib diisi.');
             redirect_superadmin('guru-page');
+        }
+
+        // Jika ditugaskan sebagai wali kelas tertentu, gunakan kelas tersebut
+        if ($wali_kelas_assign !== '' && $wali_kelas_assign !== 'none') {
+            $kelas = $wali_kelas_assign;
+        } elseif ($kelas === '') {
+            $kelas = '-';
         }
 
         if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
@@ -201,6 +209,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             if ($stmt && $stmt->execute()) {
+                // Sinkronisasi status Wali Kelas pada tabel kelas
+                if ($wali_kelas_assign !== '' && $wali_kelas_assign !== 'none') {
+                    // Update kelas yang dipilih
+                    $stmt_wk = $koneksi->prepare('UPDATE kelas SET wali_kelas = ? WHERE nama_kelas = ?');
+                    if ($stmt_wk) {
+                        $stmt_wk->bind_param('ss', $nama, $wali_kelas_assign);
+                        $stmt_wk->execute();
+                        $stmt_wk->close();
+                    }
+                }
                 set_flash_message('success', 'Data guru berhasil diperbarui.');
             } else {
                 set_flash_message('error', 'Gagal memperbarui data guru. Pastikan email dan NIP tidak duplikat.');
@@ -220,6 +238,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $stmt->bind_param('sssssssi', $nama, $email, $hashed_password, $jabatan, $nis_nip, $kelas, $mapel, $is_active);
 
             if ($stmt && $stmt->execute()) {
+                // Sinkronisasi status Wali Kelas pada tabel kelas
+                if ($wali_kelas_assign !== '' && $wali_kelas_assign !== 'none') {
+                    $stmt_wk = $koneksi->prepare('UPDATE kelas SET wali_kelas = ? WHERE nama_kelas = ?');
+                    if ($stmt_wk) {
+                        $stmt_wk->bind_param('ss', $nama, $wali_kelas_assign);
+                        $stmt_wk->execute();
+                        $stmt_wk->close();
+                    }
+                }
                 set_flash_message('success', 'Data guru berhasil ditambahkan.');
             } else {
                 set_flash_message('error', 'Gagal menambahkan data guru. Pastikan email dan NIP tidak duplikat.');
@@ -588,34 +615,159 @@ if ($active_page === 'import-page' && $server_file_exists) {
     }
 }
 
-// Total counts for summary cards
+// Parameter filter untuk Kelas, Guru, dan Wali Kelas
+$filter_kelas      = trim((string) ($_GET['filter_kelas'] ?? $_GET['kelas'] ?? ''));
+$filter_guru       = trim((string) ($_GET['filter_guru'] ?? ''));
+$filter_wali_kelas = trim((string) ($_GET['filter_wali_kelas'] ?? ''));
+
+// Ambil seluruh data kelas dari tabel kelas
+$kelas_rows_all = fetch_rows($koneksi, "SELECT id, nama_kelas, tingkat, jurusan, wali_kelas FROM kelas ORDER BY tingkat ASC, nama_kelas ASC");
+
+// Hitung jumlah siswa per kelas secara dinamis dari tabel users
+$student_counts = [];
+$res_sc = $koneksi->query("SELECT kelas, COUNT(*) as c FROM users WHERE jabatan = 'Siswa' AND kelas IS NOT NULL AND kelas != '' AND kelas != '-' GROUP BY kelas");
+if ($res_sc) {
+    while ($r = $res_sc->fetch_assoc()) {
+        $student_counts[trim($r['kelas'])] = (int) $r['c'];
+    }
+}
+
+// Susun list kelas dan mapping wali kelas (menyesuaikan dinamis)
+$all_classes_map = [];
+$wali_by_class = [];
+$class_by_wali = [];
+
+foreach ($kelas_rows_all as $k) {
+    $cName = trim($k['nama_kelas']);
+    $wName = trim($k['wali_kelas'] ?? '');
+    $all_classes_map[$cName] = [
+        'id' => (int) $k['id'],
+        'nama_kelas' => $cName,
+        'tingkat' => $k['tingkat'],
+        'jurusan' => $k['jurusan'],
+        'wali_kelas' => $wName,
+        'student_count' => $student_counts[$cName] ?? 0
+    ];
+    if ($wName !== '' && $wName !== '-') {
+        $wali_by_class[$cName] = $wName;
+        $class_by_wali[mb_strtolower($wName)][] = $cName;
+    }
+}
+
+// Tambahkan jika ada kelas pada users.kelas yang belum terdaftar di tabel kelas
+foreach ($student_counts as $cName => $sc) {
+    if (!isset($all_classes_map[$cName])) {
+        $all_classes_map[$cName] = [
+            'id' => 0,
+            'nama_kelas' => $cName,
+            'tingkat' => 'X',
+            'jurusan' => '-',
+            'wali_kelas' => '',
+            'student_count' => $sc
+        ];
+    }
+}
+$available_classes = array_values($all_classes_map);
+
+// Hitung berapa guru yang saat ini menjadi Wali Kelas
+$wali_names_set = [];
+foreach ($kelas_rows_all as $k) {
+    $w = trim($k['wali_kelas'] ?? '');
+    if ($w !== '' && $w !== '-') {
+        $wali_names_set[mb_strtolower($w)] = true;
+    }
+}
+$count_wali_guru = count($wali_names_set);
+
+// Total counts untuk summary cards global
 $count_guru  = (int) ($koneksi->query("SELECT COUNT(*) AS c FROM users WHERE jabatan = 'Guru'")->fetch_assoc()['c'] ?? 0);
 $count_siswa = (int) ($koneksi->query("SELECT COUNT(*) AS c FROM users WHERE jabatan = 'Siswa'")->fetch_assoc()['c'] ?? 0);
 $count_kelas = (int) ($koneksi->query("SELECT COUNT(*) AS c FROM kelas")->fetch_assoc()['c'] ?? 0);
 $count_user  = (int) ($koneksi->query("SELECT COUNT(*) AS c FROM users")->fetch_assoc()['c'] ?? 0);
 
-// Calculate total pages
-$total_pages_guru  = max(1, (int) ceil($count_guru  / $per_page));
-$total_pages_siswa = max(1, (int) ceil($count_siswa / $per_page));
+// --- QUERY & PAGINASI SISWA ---
+if ($filter_kelas !== '') {
+    $stmt_cs = $koneksi->prepare("SELECT COUNT(*) AS c FROM users WHERE jabatan = 'Siswa' AND kelas = ?");
+    $stmt_cs->bind_param('s', $filter_kelas);
+    $stmt_cs->execute();
+    $res_cs = $stmt_cs->get_result();
+    $count_siswa_display = (int) ($res_cs ? $res_cs->fetch_assoc()['c'] : 0);
+    $stmt_cs->close();
+
+    $total_pages_siswa = max(1, (int) ceil($count_siswa_display / $per_page));
+    $pg_siswa = min($pg_siswa, $total_pages_siswa);
+    $offset_siswa = ($pg_siswa - 1) * $per_page;
+
+    $stmt_sw = $koneksi->prepare("SELECT id, nama, email, nis_nip, kelas, jurusan, is_active FROM users WHERE jabatan = 'Siswa' AND kelas = ? ORDER BY nama ASC LIMIT ? OFFSET ?");
+    $stmt_sw->bind_param('sii', $filter_kelas, $per_page, $offset_siswa);
+    $stmt_sw->execute();
+    $res_sw = $stmt_sw->get_result();
+    $siswa_rows = [];
+    while ($r = $res_sw->fetch_assoc()) {
+        $siswa_rows[] = $r;
+    }
+    $stmt_sw->close();
+} else {
+    $count_siswa_display = $count_siswa;
+    $total_pages_siswa = max(1, (int) ceil($count_siswa / $per_page));
+    $pg_siswa = min($pg_siswa, $total_pages_siswa);
+    $offset_siswa = ($pg_siswa - 1) * $per_page;
+    $siswa_rows = fetch_rows($koneksi, "SELECT id, nama, email, nis_nip, kelas, jurusan, is_active FROM users WHERE jabatan = 'Siswa' ORDER BY nama ASC LIMIT $per_page OFFSET $offset_siswa");
+}
+
+// --- QUERY & PAGINASI GURU ---
+if ($filter_wali_kelas !== '') {
+    $target_wali = $wali_by_class[$filter_wali_kelas] ?? '';
+    if ($target_wali !== '') {
+        $stmt_cg = $koneksi->prepare("SELECT COUNT(*) AS c FROM users WHERE jabatan = 'Guru' AND (nama = ? OR kelas = ?)");
+        $stmt_cg->bind_param('ss', $target_wali, $filter_wali_kelas);
+        $stmt_cg->execute();
+        $res_cg = $stmt_cg->get_result();
+        $count_guru_display = (int) ($res_cg ? $res_cg->fetch_assoc()['c'] : 0);
+        $stmt_cg->close();
+
+        $total_pages_guru = max(1, (int) ceil($count_guru_display / $per_page));
+        $pg_guru = min($pg_guru, $total_pages_guru);
+        $offset_guru = ($pg_guru - 1) * $per_page;
+
+        $stmt_gw = $koneksi->prepare("SELECT id, nama, email, nis_nip, kelas, jurusan, is_active FROM users WHERE jabatan = 'Guru' AND (nama = ? OR kelas = ?) ORDER BY nama ASC LIMIT ? OFFSET ?");
+        $stmt_gw->bind_param('ssii', $target_wali, $filter_wali_kelas, $per_page, $offset_guru);
+        $stmt_gw->execute();
+        $res_gw = $stmt_gw->get_result();
+        $guru_rows = [];
+        while ($r = $res_gw->fetch_assoc()) {
+            $guru_rows[] = $r;
+        }
+        $stmt_gw->close();
+    } else {
+        $count_guru_display = 0;
+        $total_pages_guru = 1;
+        $offset_guru = 0;
+        $guru_rows = [];
+    }
+} elseif ($filter_guru === 'wali_only') {
+    $count_guru_display = (int) ($koneksi->query("SELECT COUNT(*) AS c FROM users WHERE jabatan = 'Guru' AND (nama IN (SELECT wali_kelas FROM kelas WHERE wali_kelas != '' AND wali_kelas != '-') OR kelas IN (SELECT nama_kelas FROM kelas))")->fetch_assoc()['c'] ?? 0);
+    $total_pages_guru = max(1, (int) ceil($count_guru_display / $per_page));
+    $pg_guru = min($pg_guru, $total_pages_guru);
+    $offset_guru = ($pg_guru - 1) * $per_page;
+
+    $guru_rows = fetch_rows($koneksi, "SELECT id, nama, email, nis_nip, kelas, jurusan, is_active FROM users WHERE jabatan = 'Guru' AND (nama IN (SELECT wali_kelas FROM kelas WHERE wali_kelas != '' AND wali_kelas != '-') OR kelas IN (SELECT nama_kelas FROM kelas)) ORDER BY nama ASC LIMIT $per_page OFFSET $offset_guru");
+} else {
+    $count_guru_display = $count_guru;
+    $total_pages_guru = max(1, (int) ceil($count_guru / $per_page));
+    $pg_guru = min($pg_guru, $total_pages_guru);
+    $offset_guru = ($pg_guru - 1) * $per_page;
+    $guru_rows = fetch_rows($koneksi, "SELECT id, nama, email, nis_nip, kelas, jurusan, is_active FROM users WHERE jabatan = 'Guru' ORDER BY nama ASC LIMIT $per_page OFFSET $offset_guru");
+}
+
+// --- PAGINASI KELAS & USER ---
 $total_pages_kelas = max(1, (int) ceil($count_kelas / $per_page));
 $total_pages_user  = max(1, (int) ceil($count_user  / $per_page));
-
-// Clamp current page
-$pg_guru  = min($pg_guru,  $total_pages_guru);
-$pg_siswa = min($pg_siswa, $total_pages_siswa);
 $pg_kelas = min($pg_kelas, $total_pages_kelas);
 $pg_user  = min($pg_user,  $total_pages_user);
-
-// Calculate offsets
-$offset_guru  = ($pg_guru  - 1) * $per_page;
-$offset_siswa = ($pg_siswa - 1) * $per_page;
 $offset_kelas = ($pg_kelas - 1) * $per_page;
 $offset_user  = ($pg_user  - 1) * $per_page;
 
-// Paginated data queries
-$guru_rows  = fetch_rows($koneksi, "SELECT id, nama, email, nis_nip, kelas, jurusan, is_active FROM users WHERE jabatan = 'Guru' ORDER BY nama ASC LIMIT $per_page OFFSET $offset_guru");
-$siswa_rows = fetch_rows($koneksi, "SELECT id, nama, email, nis_nip, kelas, jurusan, is_active FROM users WHERE jabatan = 'Siswa' ORDER BY nama ASC LIMIT $per_page OFFSET $offset_siswa");
-$kelas_rows_all = fetch_rows($koneksi, "SELECT id, nama_kelas, tingkat, jurusan, wali_kelas FROM kelas ORDER BY tingkat ASC, nama_kelas ASC");
 $kelas_rows = array_slice($kelas_rows_all, $offset_kelas, $per_page);
 $user_rows  = fetch_rows($koneksi, "SELECT id, nama, email, jabatan, nis_nip, kelas, jurusan, is_active FROM users ORDER BY created_at DESC LIMIT $per_page OFFSET $offset_user");
 
@@ -881,6 +1033,171 @@ function pagination_url(string $page, string $param, int $pg_num): string {
             color: #2563eb;
             font-size: 13px;
             font-weight: 700;
+        }
+
+        .class-filter-bar {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            background: #ffffff;
+            border: 1.5px solid #cbd5e1;
+            padding: 6px 14px;
+            border-radius: 12px;
+            box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05);
+            transition: all 0.2s ease;
+        }
+
+        .class-filter-bar:focus-within {
+            border-color: #2563eb;
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+        }
+
+        .class-filter-bar .filter-label {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            font-weight: 700;
+            color: #1e293b;
+            white-space: nowrap;
+        }
+
+        .class-filter-bar .filter-select {
+            border: 1px solid #cbd5e1;
+            background: #f8fafc;
+            color: #0f172a;
+            font-size: 13.5px;
+            font-weight: 600;
+            padding: 7px 12px;
+            border-radius: 8px;
+            outline: none;
+            cursor: pointer;
+            min-width: 260px;
+            max-width: 380px;
+            transition: border-color 0.2s;
+        }
+
+        .class-filter-bar .filter-select:hover,
+        .class-filter-bar .filter-select:focus {
+            border-color: #2563eb;
+            background: #ffffff;
+        }
+
+        .btn-clear-filter {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 6px 10px;
+            background: #fee2e2;
+            color: #b91c1c;
+            border-radius: 8px;
+            font-size: 12px;
+            font-weight: 700;
+            text-decoration: none;
+            white-space: nowrap;
+            transition: background 0.2s;
+        }
+
+        .btn-clear-filter:hover {
+            background: #fecaca;
+        }
+
+        .active-filter-badge {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 10px;
+            background: linear-gradient(135deg, #eff6ff 0%, #f0fdf4 100%);
+            border: 1px solid #bfdbfe;
+            border-radius: 12px;
+            padding: 10px 16px;
+            margin-bottom: 18px;
+            font-size: 13px;
+            color: #1e3a8a;
+        }
+
+        .active-filter-badge .pill-item {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            background: #ffffff;
+            padding: 5px 12px;
+            border-radius: 8px;
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+        }
+
+        .active-filter-badge .pill-link {
+            margin-left: auto;
+            color: #2563eb;
+            font-weight: 700;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .active-filter-badge .pill-link:hover {
+            text-decoration: underline;
+        }
+
+        .badge-wali {
+            background: #ede9fe;
+            color: #5b21b6;
+            border: 1px solid #ddd6fe;
+            font-weight: 700;
+            font-size: 11px;
+            padding: 4px 8px;
+            border-radius: 6px;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .badge-mapel {
+            background: #f1f5f9;
+            color: #64748b;
+            font-size: 11px;
+            padding: 4px 8px;
+            border-radius: 6px;
+        }
+
+        .sidebar-subnav {
+            margin: 4px 0 10px 12px;
+            padding-left: 10px;
+            border-left: 2px solid rgba(255, 255, 255, 0.15);
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            max-height: 220px;
+            overflow-y: auto;
+        }
+
+        .sidebar-subnav-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            color: rgba(255, 255, 255, 0.75);
+            font-size: 12px;
+            text-decoration: none;
+            padding: 5px 8px;
+            border-radius: 6px;
+            transition: all 0.2s;
+        }
+
+        .sidebar-subnav-item:hover,
+        .sidebar-subnav-item.active {
+            color: #ffffff;
+            background: rgba(255, 255, 255, 0.15);
+            font-weight: 600;
+        }
+
+        .sidebar-subnav-item .sub-count {
+            background: rgba(255, 255, 255, 0.25);
+            font-size: 10px;
+            font-weight: 700;
+            padding: 2px 6px;
+            border-radius: 10px;
         }
 
         .content-grid {
@@ -1245,7 +1562,35 @@ function pagination_url(string $page, string $param, int $pg_num): string {
             <p class="sidebar-text">Kelola seluruh data utama sistem Aplikasi Reading Log Untuk Meningkatkan Literasi Rajin Membaca Siswa SMKN 3 Malang</p>
             <div class="nav-menu">
                 <a class="nav-button <?php echo $active_page === 'guru-page' ? 'active' : ''; ?>" href="?page=guru-page">Menu Guru</a>
+                <?php if ($active_page === 'guru-page'): ?>
+                    <div class="sidebar-subnav">
+                        <a class="sidebar-subnav-item <?php echo ($filter_guru === '' && $filter_wali_kelas === '') ? 'active' : ''; ?>" href="?page=guru-page">
+                            <span>Semua Guru</span>
+                            <span class="sub-count"><?php echo $count_guru; ?></span>
+                        </a>
+                        <a class="sidebar-subnav-item <?php echo ($filter_guru === 'wali_only') ? 'active' : ''; ?>" href="?page=guru-page&filter_guru=wali_only">
+                            <span>⭐ Wali Kelas</span>
+                            <span class="sub-count"><?php echo $count_wali_guru; ?></span>
+                        </a>
+                    </div>
+                <?php endif; ?>
+
                 <a class="nav-button <?php echo $active_page === 'siswa-page' ? 'active' : ''; ?>" href="?page=siswa-page">Menu Siswa</a>
+                <?php if ($active_page === 'siswa-page'): ?>
+                    <div class="sidebar-subnav">
+                        <a class="sidebar-subnav-item <?php echo ($filter_kelas === '') ? 'active' : ''; ?>" href="?page=siswa-page">
+                            <span>Semua Siswa</span>
+                            <span class="sub-count"><?php echo $count_siswa; ?></span>
+                        </a>
+                        <?php foreach ($available_classes as $k): ?>
+                            <a class="sidebar-subnav-item <?php echo ($filter_kelas === $k['nama_kelas']) ? 'active' : ''; ?>" href="?page=siswa-page&filter_kelas=<?php echo urlencode($k['nama_kelas']); ?>">
+                                <span title="<?php echo esc($k['nama_kelas']); ?>"><?php echo esc($k['nama_kelas']); ?></span>
+                                <span class="sub-count"><?php echo $k['student_count']; ?></span>
+                            </a>
+                        <?php endforeach; ?>
+                    </div>
+                <?php endif; ?>
+
                 <a class="nav-button <?php echo $active_page === 'kelas-page' ? 'active' : ''; ?>" href="?page=kelas-page">Menu Kelas</a>
                 <a class="nav-button <?php echo $active_page === 'user-page' ? 'active' : ''; ?>" href="?page=user-page">Management User</a>
                 <a class="nav-button <?php echo $active_page === 'import-page' ? 'active' : ''; ?>" href="?page=import-page">Import Data Excel</a>
@@ -1292,9 +1637,55 @@ function pagination_url(string $page, string $param, int $pg_num): string {
                     <div class="section-head">
                         <div>
                             <h2>Menu Guru</h2>
+                            <p style="color:#64748b; font-size:13px; margin-top:2px;">Kelola akun guru pengajar dan penugasan wali kelas</p>
                         </div>
-                        <div class="status-note"></div>
+                        <div class="status-note" style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+                            <div class="class-filter-bar">
+                                <label for="filter-guru-wali" class="filter-label">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="2"><path d="M22 10v6M2 10l10-5 10 5-10 5z"></path><path d="M6 12v5c3 3 9 3 12 0v-5"></path></svg>
+                                    <span>Menu Wali Kelas:</span>
+                                </label>
+                                <select id="filter-guru-wali" class="filter-select" onchange="window.location.href=this.value;">
+                                    <option value="?page=guru-page">👥 Semua Guru (<?php echo $count_guru; ?> Guru)</option>
+                                    <option value="?page=guru-page&filter_guru=wali_only" <?php echo ($filter_guru === 'wali_only') ? 'selected' : ''; ?>>
+                                        ⭐ Khusus Guru Wali Kelas (<?php echo $count_wali_guru; ?> Wali Kelas)
+                                    </option>
+                                    <optgroup label="── PILIH WALI KELAS ──">
+                                        <?php foreach ($available_classes as $k): ?>
+                                            <?php 
+                                                $valUrl = '?page=guru-page&filter_wali_kelas=' . urlencode($k['nama_kelas']);
+                                                $isSel = ($filter_wali_kelas === $k['nama_kelas']);
+                                                $waliTxt = !empty($k['wali_kelas']) && $k['wali_kelas'] !== '-' ? esc($k['wali_kelas']) : 'Belum Ditugaskan';
+                                            ?>
+                                            <option value="<?php echo $valUrl; ?>" <?php echo $isSel ? 'selected' : ''; ?>>
+                                                🎓 Wali Kelas <?php echo esc($k['nama_kelas']); ?> (<?php echo $waliTxt; ?>)
+                                            </option>
+                                        <?php endforeach; ?>
+                                    </optgroup>
+                                </select>
+                                <?php if ($filter_guru !== '' || $filter_wali_kelas !== ''): ?>
+                                    <a href="?page=guru-page" class="btn-clear-filter" title="Tampilkan Semua Guru">✕ Reset</a>
+                                <?php endif; ?>
+                            </div>
+                        </div>
                     </div>
+
+                    <?php if ($filter_wali_kelas !== ''): ?>
+                        <div class="active-filter-badge">
+                            <span class="pill-item">🎓 Filter Wali Kelas: <strong><?php echo esc($filter_wali_kelas); ?></strong></span>
+                            <span class="pill-item">👤 Nama Wali: <strong><?php echo esc($wali_by_class[$filter_wali_kelas] ?? 'Belum Ditugaskan'); ?></strong></span>
+                            <span class="pill-item">👥 Siswa Terdaftar: <strong><?php echo (int)($student_counts[$filter_wali_kelas] ?? 0); ?> Siswa</strong></span>
+                            <a href="?page=siswa-page&filter_kelas=<?php echo urlencode($filter_wali_kelas); ?>" class="pill-link">Lihat Siswa Kelas Ini &rarr;</a>
+                            <a href="?page=guru-page" class="btn-clear-filter" style="margin-left:8px;">✕ Tampilkan Semua Guru</a>
+                        </div>
+                    <?php elseif ($filter_guru === 'wali_only'): ?>
+                        <div class="active-filter-badge">
+                            <span class="pill-item">⭐ Menampilkan: <strong>Seluruh Guru Wali Kelas</strong> (<?php echo $count_guru_display; ?> Guru)</span>
+                            <span class="pill-item">🏫 Total Kelas: <strong><?php echo $count_kelas; ?> Kelas Terdaftar</strong></span>
+                            <a href="?page=guru-page" class="btn-clear-filter" style="margin-left:auto;">✕ Tampilkan Semua Guru</a>
+                        </div>
+                    <?php endif; ?>
+
                     <div class="content-grid">
                         <div class="form-card">
                             <h3><?php echo $edit_guru ? 'Edit Guru' : 'Tambah Guru'; ?></h3>
@@ -1317,12 +1708,31 @@ function pagination_url(string $page, string $param, int $pg_num): string {
                                     <input type="text" id="guru-nis_nip" name="nis_nip" value="<?php echo esc($edit_guru['nis_nip'] ?? ''); ?>" required>
                                 </div>
                                 <div class="form-group">
+                                    <label for="guru-wali-assign">Tugaskan Sebagai Wali Kelas</label>
+                                    <?php 
+                                    $currWaliClass = '';
+                                    if ($edit_guru) {
+                                        $gCleanEdit = mb_strtolower(trim($edit_guru['nama']));
+                                        $currWaliClass = $class_by_wali[$gCleanEdit][0] ?? $edit_guru['kelas'] ?? '';
+                                    }
+                                    ?>
+                                    <select id="guru-wali-assign" name="wali_kelas_assign" onchange="if(this.value && document.getElementById('guru-kelas').value === '') { document.getElementById('guru-kelas').value = this.value; }">
+                                        <option value="">-- Bukan Wali Kelas (Guru Mapel) --</option>
+                                        <?php foreach ($available_classes as $k): ?>
+                                            <option value="<?php echo esc($k['nama_kelas']); ?>" <?php echo (strcasecmp($currWaliClass, $k['nama_kelas']) === 0) ? 'selected' : ''; ?>>
+                                                Wali Kelas <?php echo esc($k['nama_kelas']); ?>
+                                            </option>
+                                        <?php endforeach; ?>
+                                    </select>
+                                    <div class="help-text">Jika dipilih, guru ini otomatis tercatat sebagai Wali Kelas pada data kelas tersebut.</div>
+                                </div>
+                                <div class="form-group">
                                     <label for="guru-kelas">Kelas Ajar</label>
-                                    <input type="text" id="guru-kelas" name="kelas" value="<?php echo esc($edit_guru['kelas'] ?? ''); ?>" required>
+                                    <input type="text" id="guru-kelas" name="kelas" value="<?php echo esc($edit_guru['kelas'] ?? ''); ?>" placeholder="Contoh: X Perhotelan 1 / Semua Kelas" required>
                                 </div>
                                 <div class="form-group">
                                     <label for="guru-jurusan">Mata Pelajaran / Bidang</label>
-                                    <input type="text" id="guru-jurusan" name="jurusan" value="<?php echo esc($edit_guru['jurusan'] ?? ''); ?>" required>
+                                    <input type="text" id="guru-jurusan" name="jurusan" value="<?php echo esc($edit_guru['jurusan'] ?? ''); ?>" placeholder="Contoh: Produktif Perhotelan" required>
                                 </div>
                                 <div class="form-group">
                                     <label for="guru-password">Password</label>
@@ -1351,9 +1761,9 @@ function pagination_url(string $page, string $param, int $pg_num): string {
                             </form>
                         </div>
                         <div class="table-card">
-                            <h3>Daftar Guru</h3>
+                            <h3>Daftar Guru <?php echo ($filter_wali_kelas !== '') ? ': Wali Kelas ' . esc($filter_wali_kelas) : (($filter_guru === 'wali_only') ? ': Khusus Wali Kelas' : ''); ?></h3>
                             <?php if (!$guru_rows): ?>
-                                <div class="empty-state">Belum ada data guru di database.</div>
+                                <div class="empty-state">Belum ada data guru yang sesuai filter di database.</div>
                             <?php else: ?>
                                 <div class="table-wrapper">
                                     <table>
@@ -1363,6 +1773,7 @@ function pagination_url(string $page, string $param, int $pg_num): string {
                                                 <th>Nama</th>
                                                 <th>Email</th>
                                                 <th>NIP</th>
+                                                <th>Peran / Wali Kelas</th>
                                                 <th>Kelas Ajar</th>
                                                 <th>Bidang</th>
                                                 <th>Status</th>
@@ -1371,11 +1782,25 @@ function pagination_url(string $page, string $param, int $pg_num): string {
                                         </thead>
                                         <tbody>
                                             <?php foreach ($guru_rows as $index => $guru): ?>
+                                                <?php 
+                                                    $gClean = mb_strtolower(trim($guru['nama']));
+                                                    $waliClasses = $class_by_wali[$gClean] ?? [];
+                                                    $isWali = !empty($waliClasses);
+                                                ?>
                                                 <tr>
                                                     <td><?php echo $offset_guru + $index + 1; ?></td>
-                                                    <td><?php echo esc($guru['nama']); ?></td>
+                                                    <td><strong><?php echo esc($guru['nama']); ?></strong></td>
                                                     <td><?php echo esc($guru['email']); ?></td>
                                                     <td><?php echo esc($guru['nis_nip']); ?></td>
+                                                    <td>
+                                                        <?php if ($isWali): ?>
+                                                            <span class="badge-wali" title="Wali Kelas <?php echo esc(implode(', ', $waliClasses)); ?>">
+                                                                🎓 Wali Kelas: <?php echo esc(implode(', ', $waliClasses)); ?>
+                                                            </span>
+                                                        <?php else: ?>
+                                                            <span class="badge-mapel">Guru Mapel</span>
+                                                        <?php endif; ?>
+                                                    </td>
                                                     <td><?php echo esc($guru['kelas']); ?></td>
                                                     <td><?php echo esc($guru['jurusan']); ?></td>
                                                     <td>
@@ -1403,7 +1828,7 @@ function pagination_url(string $page, string $param, int $pg_num): string {
                                         <?php endif; ?>
                                     <?php endfor; ?>
                                     <a class="<?php echo $pg_guru >= $total_pages_guru ? 'disabled' : ''; ?>" href="<?php echo pagination_url('guru-page', 'pg_guru', $pg_guru + 1); ?>">Next &raquo;</a>
-                                    <span class="page-info">Halaman <?php echo $pg_guru; ?> dari <?php echo $total_pages_guru; ?> (<?php echo $count_guru; ?> data)</span>
+                                    <span class="page-info">Halaman <?php echo $pg_guru; ?> dari <?php echo $total_pages_guru; ?> (<?php echo $count_guru_display; ?> data)</span>
                                 </nav>
                                 <?php endif; ?>
                             <?php endif; ?>
@@ -1417,14 +1842,54 @@ function pagination_url(string $page, string $param, int $pg_num): string {
                     <div class="section-head">
                         <div>
                             <h2>Menu Siswa</h2>
+                            <p style="color:#64748b; font-size:13px; margin-top:2px;">Kelola data siswa per-kelas dan monitoring membaca</p>
                         </div>
-                        <div class="status-note">
+                        <div class="status-note" style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+                            <div class="class-filter-bar">
+                                <label for="filter-siswa-kelas" class="filter-label">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
+                                    <span>Menu Kelas:</span>
+                                </label>
+                                <select id="filter-siswa-kelas" class="filter-select" onchange="window.location.href=this.value;">
+                                    <option value="?page=siswa-page">📋 Semua Kelas (<?php echo $count_siswa; ?> Siswa)</option>
+                                    <optgroup label="── PILIH KELAS SISWA ──">
+                                        <?php foreach ($available_classes as $k): ?>
+                                            <?php 
+                                                $valUrl = '?page=siswa-page&filter_kelas=' . urlencode($k['nama_kelas']);
+                                                $isSel = ($filter_kelas === $k['nama_kelas']);
+                                                $sCount = (int)($k['student_count'] ?? 0);
+                                                $waliInfo = !empty($k['wali_kelas']) && $k['wali_kelas'] !== '-' ? ' — Wali: ' . esc($k['wali_kelas']) : '';
+                                            ?>
+                                            <option value="<?php echo $valUrl; ?>" <?php echo $isSel ? 'selected' : ''; ?>>
+                                                🏫 <?php echo esc($k['nama_kelas']); ?> (<?php echo $sCount; ?> Siswa)<?php echo $waliInfo; ?>
+                                            </option>
+                                        <?php endforeach; ?>
+                                    </optgroup>
+                                </select>
+                                <?php if ($filter_kelas !== ''): ?>
+                                    <a href="?page=siswa-page" class="btn-clear-filter" title="Tampilkan Semua Kelas">✕ Reset</a>
+                                <?php endif; ?>
+                            </div>
+
                             <a class="btn btn-primary" href="?page=import-page" style="text-decoration:none; display:inline-flex; align-items:center; gap:6px; font-size:14px; padding:8px 14px;">
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
                                 Import Excel
                             </a>
                         </div>
                     </div>
+
+                    <?php if ($filter_kelas !== ''): ?>
+                        <div class="active-filter-badge">
+                            <span class="pill-item">🏫 Kelas: <strong><?php echo esc($filter_kelas); ?></strong></span>
+                            <span class="pill-item">👤 Wali Kelas: <strong><?php echo esc($wali_by_class[$filter_kelas] ?? 'Belum Ditentukan'); ?></strong></span>
+                            <span class="pill-item">👥 Siswa Terdaftar: <strong><?php echo $count_siswa_display; ?> Siswa</strong></span>
+                            <?php if (!empty($wali_by_class[$filter_kelas]) && $wali_by_class[$filter_kelas] !== '-'): ?>
+                                <a href="?page=guru-page&filter_wali_kelas=<?php echo urlencode($filter_kelas); ?>" class="pill-link">Lihat Wali Kelas &rarr;</a>
+                            <?php endif; ?>
+                            <a href="?page=siswa-page" class="btn-clear-filter" style="margin-left:8px;">✕ Tampilkan Semua Kelas</a>
+                        </div>
+                    <?php endif; ?>
+
                     <div class="content-grid">
                         <div class="form-card">
                             <h3><?php echo $edit_siswa ? 'Edit Siswa' : 'Tambah Siswa'; ?></h3>
@@ -1449,7 +1914,7 @@ function pagination_url(string $page, string $param, int $pg_num): string {
                                 <div class="form-group">
                                     <label for="siswa-kelas">Kelas</label>
                                     <?php
-                                    $current_siswa_kelas = trim((string)($edit_siswa['kelas'] ?? ''));
+                                    $current_siswa_kelas = trim((string)($edit_siswa['kelas'] ?? ($filter_kelas !== '' ? $filter_kelas : '')));
                                     $kelas_in_list = false;
                                     foreach ($kelas_rows_all as $k) {
                                         if ($current_siswa_kelas !== '' && strcasecmp($current_siswa_kelas, $k['nama_kelas']) === 0) {
@@ -1471,7 +1936,7 @@ function pagination_url(string $page, string $param, int $pg_num): string {
                                             <option value="<?php echo esc($kelas['nama_kelas']); ?>" 
                                                 data-jurusan="<?php echo esc($kelas['jurusan']); ?>"
                                                 data-wali-kelas="<?php echo esc($kelas['wali_kelas']); ?>"
-                                                <?php echo ($kelas_in_list && strcasecmp($current_siswa_kelas, $kelas['nama_kelas']) === 0) ? 'selected' : ''; ?>>
+                                                <?php echo ($current_siswa_kelas !== '' && strcasecmp($current_siswa_kelas, $kelas['nama_kelas']) === 0) ? 'selected' : ''; ?>>
                                                 <?php echo esc($kelas['nama_kelas']); ?> (<?php echo esc($kelas['tingkat']); ?>)
                                             </option>
                                         <?php endforeach; ?>
@@ -1504,14 +1969,14 @@ function pagination_url(string $page, string $param, int $pg_num): string {
                                 </div>
                                 <div class="action-row">
                                     <button type="submit" class="btn btn-primary"><?php echo $edit_siswa ? 'Update Siswa' : 'Simpan Siswa'; ?></button>
-                                    <a class="btn btn-secondary" href="?page=siswa-page">Bersihkan</a>
+                                    <a class="btn btn-secondary" href="?page=siswa-page<?php echo ($filter_kelas !== '') ? '&filter_kelas=' . urlencode($filter_kelas) : ''; ?>">Bersihkan</a>
                                 </div>
                             </form>
                         </div>
                         <div class="table-card">
-                            <h3>Daftar Siswa</h3>
+                            <h3>Daftar Siswa <?php echo ($filter_kelas !== '') ? ': ' . esc($filter_kelas) . ' (' . $count_siswa_display . ' Siswa)' : ''; ?></h3>
                             <?php if (!$siswa_rows): ?>
-                                <div class="empty-state">Belum ada data siswa di database.</div>
+                                <div class="empty-state">Belum ada data siswa yang sesuai filter di database.</div>
                             <?php else: ?>
                                 <div class="table-wrapper">
                                     <table>
@@ -1531,10 +1996,14 @@ function pagination_url(string $page, string $param, int $pg_num): string {
                                             <?php foreach ($siswa_rows as $index => $siswa): ?>
                                                 <tr>
                                                     <td><?php echo $offset_siswa + $index + 1; ?></td>
-                                                    <td><?php echo esc($siswa['nama']); ?></td>
+                                                    <td><strong><?php echo esc($siswa['nama']); ?></strong></td>
                                                     <td><?php echo esc($siswa['email']); ?></td>
                                                     <td><?php echo esc($siswa['nis_nip']); ?></td>
-                                                    <td><?php echo esc($siswa['kelas']); ?></td>
+                                                    <td>
+                                                        <a href="?page=siswa-page&filter_kelas=<?php echo urlencode($siswa['kelas']); ?>" style="color:#2563eb; font-weight:600; text-decoration:none;">
+                                                            <?php echo esc($siswa['kelas']); ?>
+                                                        </a>
+                                                    </td>
                                                     <td><?php echo esc($siswa['jurusan']); ?></td>
                                                     <td>
                                                         <span class="badge <?php echo ((int) $siswa['is_active'] === 1) ? 'badge-success' : 'badge-muted'; ?>">
@@ -1542,8 +2011,8 @@ function pagination_url(string $page, string $param, int $pg_num): string {
                                                         </span>
                                                     </td>
                                                     <td>
-                                                        <a class="btn btn-edit" href="?page=siswa-page&edit=siswa&id=<?php echo (int) $siswa['id']; ?>">Edit</a>
-                                                        <a class="btn btn-delete" href="?page=siswa-page&action=delete_siswa&id=<?php echo (int) $siswa['id']; ?>" onclick="return confirm('Hapus data siswa ini?');">Hapus</a>
+                                                        <a class="btn btn-edit" href="?page=siswa-page&edit=siswa&id=<?php echo (int) $siswa['id']; ?><?php echo ($filter_kelas !== '') ? '&filter_kelas=' . urlencode($filter_kelas) : ''; ?>">Edit</a>
+                                                        <a class="btn btn-delete" href="?page=siswa-page&action=delete_siswa&id=<?php echo (int) $siswa['id']; ?><?php echo ($filter_kelas !== '') ? '&filter_kelas=' . urlencode($filter_kelas) : ''; ?>" onclick="return confirm('Hapus data siswa ini?');">Hapus</a>
                                                     </td>
                                                 </tr>
                                             <?php endforeach; ?>
@@ -1561,7 +2030,7 @@ function pagination_url(string $page, string $param, int $pg_num): string {
                                         <?php endif; ?>
                                     <?php endfor; ?>
                                     <a class="<?php echo $pg_siswa >= $total_pages_siswa ? 'disabled' : ''; ?>" href="<?php echo pagination_url('siswa-page', 'pg_siswa', $pg_siswa + 1); ?>">Next &raquo;</a>
-                                    <span class="page-info">Halaman <?php echo $pg_siswa; ?> dari <?php echo $total_pages_siswa; ?> (<?php echo $count_siswa; ?> data)</span>
+                                    <span class="page-info">Halaman <?php echo $pg_siswa; ?> dari <?php echo $total_pages_siswa; ?> (<?php echo $count_siswa_display; ?> data)</span>
                                 </nav>
                                 <?php endif; ?>
                             <?php endif; ?>
