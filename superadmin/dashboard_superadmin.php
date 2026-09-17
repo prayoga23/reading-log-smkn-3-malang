@@ -7,7 +7,7 @@ if (!isset($_SESSION['user_id']) || ($_SESSION['jabatan'] ?? '') !== 'Super Admi
     exit;
 }
 
-$allowed_pages = ['guru-page', 'siswa-page', 'kelas-page', 'user-page'];
+$allowed_pages = ['guru-page', 'siswa-page', 'kelas-page', 'user-page', 'import-page'];
 $active_page = $_GET['page'] ?? 'guru-page';
 if (!in_array($active_page, $allowed_pages, true)) {
     $active_page = 'guru-page';
@@ -35,6 +35,10 @@ $page_meta = [
     'user-page' => [
         'title' => 'Management User',
         'desc' => 'Kelola akun login semua user langsung '
+    ],
+    'import-page' => [
+        'title' => 'Import Data Excel / CSV',
+        'desc' => 'Import data Siswa, Wali Kelas (Guru), dan Kelas secara instan dari file Excel (.xlsx) atau CSV.'
     ]
 ];
 
@@ -410,6 +414,80 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         redirect_superadmin('user-page');
     }
+
+    if ($form_action === 'import_excel') {
+        require_once __DIR__ . '/../includes/simple_xlsx_importer.php';
+
+        $mode = $_POST['import_mode'] ?? 'school_format';
+        $target_sheet = trim($_POST['target_sheet'] ?? 'all');
+        $source_type = $_POST['source_type'] ?? 'upload';
+
+        $file_path = '';
+
+        if ($source_type === 'server_file') {
+            $server_file = dirname(__DIR__) . '/A. KELAS X 2026-2027.xlsx';
+            if (file_exists($server_file)) {
+                $file_path = $server_file;
+            } else {
+                set_flash_message('error', 'File di server tidak ditemukan.');
+                redirect_superadmin('import-page');
+            }
+        } else {
+            if (!isset($_FILES['excel_file']) || $_FILES['excel_file']['error'] !== UPLOAD_ERR_OK) {
+                set_flash_message('error', 'Silakan pilih file Excel (.xlsx) atau CSV yang valid untuk diunggah.');
+                redirect_superadmin('import-page');
+            }
+
+            $orig_name = $_FILES['excel_file']['name'];
+            $ext = strtolower(pathinfo($orig_name, PATHINFO_EXTENSION));
+            if (!in_array($ext, ['xlsx', 'csv', 'xls'], true)) {
+                set_flash_message('error', 'Format file tidak didukung. Harap gunakan file Excel (.xlsx) atau CSV (.csv).');
+                redirect_superadmin('import-page');
+            }
+
+            $file_path = $_FILES['excel_file']['tmp_name'];
+        }
+
+        try {
+            $is_csv = false;
+            if ($source_type === 'upload') {
+                $ext = strtolower(pathinfo($_FILES['excel_file']['name'], PATHINFO_EXTENSION));
+                $is_csv = ($ext === 'csv');
+            } else {
+                $ext = strtolower(pathinfo($file_path, PATHINFO_EXTENSION));
+                $is_csv = ($ext === 'csv');
+            }
+
+            if ($is_csv) {
+                $sheets = SimpleXlsxImporter::parseCsv($file_path);
+            } else {
+                $sheets = SimpleXlsxImporter::parseXlsx($file_path);
+            }
+
+            if ($mode === 'standard_format') {
+                $firstSheet = reset($sheets);
+                $summary = SimpleXlsxImporter::importStandardTable($firstSheet, $koneksi);
+            } else {
+                $summary = SimpleXlsxImporter::importSchoolSheets($sheets, $koneksi, ['target_sheet' => $target_sheet]);
+            }
+
+            $_SESSION['last_import_summary'] = $summary;
+            $msg = "Import Berhasil! {$summary['kelas_count']} Kelas, {$summary['guru_count']} Wali Kelas, dan {$summary['siswa_count']} Siswa berhasil diproses.";
+            set_flash_message('success', $msg);
+        } catch (Throwable $e) {
+            set_flash_message('error', 'Gagal memproses file: ' . $e->getMessage());
+        }
+
+        redirect_superadmin('import-page');
+    }
+}
+
+if (isset($_GET['action'])) {
+    if ($_GET['action'] === 'download_template') {
+        require_once __DIR__ . '/../includes/simple_xlsx_importer.php';
+        SimpleXlsxImporter::downloadTemplateCsv();
+        exit;
+    }
 }
 
 if (isset($_GET['action'], $_GET['id'])) {
@@ -494,6 +572,21 @@ if (isset($_GET['edit'], $_GET['id'])) {
 }
 
 $flash = get_flash_message();
+$import_summary = $_SESSION['last_import_summary'] ?? null;
+unset($_SESSION['last_import_summary']);
+
+$server_xlsx_file = dirname(__DIR__) . '/A. KELAS X 2026-2027.xlsx';
+$server_file_exists = file_exists($server_xlsx_file);
+$server_rosters = [];
+if ($active_page === 'import-page' && $server_file_exists) {
+    require_once __DIR__ . '/../includes/simple_xlsx_importer.php';
+    try {
+        $server_sheets = SimpleXlsxImporter::parseXlsx($server_xlsx_file);
+        $server_rosters = SimpleXlsxImporter::inspectRosterSheets($server_sheets);
+    } catch (Throwable $e) {
+        $server_rosters = [];
+    }
+}
 
 // Total counts for summary cards
 $count_guru  = (int) ($koneksi->query("SELECT COUNT(*) AS c FROM users WHERE jabatan = 'Guru'")->fetch_assoc()['c'] ?? 0);
@@ -932,6 +1025,77 @@ function pagination_url(string $page, string $param, int $pg_num): string {
             color: #fff;
         }
 
+        /* Import page styling */
+        .upload-dropzone {
+            border: 2px dashed #93c5fd;
+            border-radius: 14px;
+            padding: 26px 20px;
+            text-align: center;
+            background: #f8fafc;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            position: relative;
+        }
+
+        .upload-dropzone:hover,
+        .upload-dropzone.dragover {
+            border-color: #2563eb;
+            background: #eff6ff;
+            transform: translateY(-1px);
+        }
+
+        .upload-dropzone input[type="file"] {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            opacity: 0;
+            cursor: pointer;
+        }
+
+        .upload-icon {
+            color: #2563eb;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: center;
+        }
+
+        .server-file-box {
+            background: #f0fdf4;
+            border: 1px solid #bbf7d0;
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 20px;
+        }
+
+        .result-summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .result-card {
+            background: #fff;
+            border-radius: 10px;
+            padding: 14px;
+            border: 1px solid #e2e8f0;
+            text-align: center;
+        }
+
+        .result-number {
+            font-size: 26px;
+            font-weight: 700;
+            color: #2563eb;
+        }
+
+        .result-label {
+            font-size: 13px;
+            color: #64748b;
+            margin-top: 4px;
+        }
+
         .table-wrapper {
             overflow-x: auto;
         }
@@ -1084,6 +1248,7 @@ function pagination_url(string $page, string $param, int $pg_num): string {
                 <a class="nav-button <?php echo $active_page === 'siswa-page' ? 'active' : ''; ?>" href="?page=siswa-page">Menu Siswa</a>
                 <a class="nav-button <?php echo $active_page === 'kelas-page' ? 'active' : ''; ?>" href="?page=kelas-page">Menu Kelas</a>
                 <a class="nav-button <?php echo $active_page === 'user-page' ? 'active' : ''; ?>" href="?page=user-page">Management User</a>
+                <a class="nav-button <?php echo $active_page === 'import-page' ? 'active' : ''; ?>" href="?page=import-page">Import Data Excel</a>
             </div>
         </aside>
 
@@ -1253,7 +1418,12 @@ function pagination_url(string $page, string $param, int $pg_num): string {
                         <div>
                             <h2>Menu Siswa</h2>
                         </div>
-                        <div class="status-note"></div>
+                        <div class="status-note">
+                            <a class="btn btn-primary" href="?page=import-page" style="text-decoration:none; display:inline-flex; align-items:center; gap:6px; font-size:14px; padding:8px 14px;">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                                Import Excel
+                            </a>
+                        </div>
                     </div>
                     <div class="content-grid">
                         <div class="form-card">
@@ -1406,7 +1576,12 @@ function pagination_url(string $page, string $param, int $pg_num): string {
                         <div>
                             <h2>Menu Kelas</h2>
                         </div>
-                        <div class="status-note"></div>
+                        <div class="status-note">
+                            <a class="btn btn-primary" href="?page=import-page" style="text-decoration:none; display:inline-flex; align-items:center; gap:6px; font-size:14px; padding:8px 14px;">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                                Import Excel
+                            </a>
+                        </div>
                     </div>
                     <div class="content-grid">
                         <div class="form-card">
@@ -1634,6 +1809,177 @@ function pagination_url(string $page, string $param, int $pg_num): string {
                     </div>
                 </div>
             </section>
+
+            <!-- IMPORT DATA EXCEL SECTION -->
+            <section class="page <?php echo $active_page === 'import-page' ? 'active' : ''; ?>">
+                <div class="section-card">
+                    <div class="section-head">
+                        <div>
+                            <h2>Import Data Excel / CSV</h2>
+                        </div>
+                        <div class="status-note">
+                            <a class="btn btn-secondary" href="?action=download_template" style="display:inline-flex; align-items:center; gap:6px; text-decoration:none; font-size:14px;">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                                Unduh Template CSV
+                            </a>
+                        </div>
+                    </div>
+
+                    <?php if ($import_summary): ?>
+                        <div style="background:#f0fdf4; border:1px solid #86efac; border-radius:14px; padding:20px; margin-bottom:24px;">
+                            <h3 style="color:#166534; font-size:17px; margin-bottom:12px; display:flex; align-items:center; gap:8px;">
+                                <span>🎉</span> Hasil Import Data Terakhir
+                            </h3>
+                            <div class="result-summary-grid">
+                                <div class="result-card">
+                                    <div class="result-number" style="color:#16a34a;"><?php echo (int) $import_summary['kelas_count']; ?></div>
+                                    <div class="result-label">Kelas Diperbarui</div>
+                                </div>
+                                <div class="result-card">
+                                    <div class="result-number" style="color:#2563eb;"><?php echo (int) $import_summary['guru_count']; ?></div>
+                                    <div class="result-label">Wali Kelas (Guru)</div>
+                                </div>
+                                <div class="result-card">
+                                    <div class="result-number" style="color:#9333ea;"><?php echo (int) $import_summary['siswa_count']; ?></div>
+                                    <div class="result-label">Siswa Terdaftar</div>
+                                </div>
+                                <?php if (($import_summary['skipped'] ?? 0) > 0): ?>
+                                <div class="result-card">
+                                    <div class="result-number" style="color:#ea580c;"><?php echo (int) $import_summary['skipped']; ?></div>
+                                    <div class="result-label">Dilewati</div>
+                                </div>
+                                <?php endif; ?>
+                            </div>
+                            <?php if (!empty($import_summary['details'])): ?>
+                                <div style="margin-top:14px; padding:12px; background:#fff; border-radius:10px; border:1px solid #bbf7d0; max-height:200px; overflow-y:auto; font-size:13px; line-height:1.7;">
+                                    <?php foreach ($import_summary['details'] as $detail): ?>
+                                        <div>✅ <?php echo $detail; ?></div>
+                                    <?php endforeach; ?>
+                                </div>
+                            <?php endif; ?>
+                        </div>
+                    <?php endif; ?>
+
+                    <div class="content-grid">
+                        <div class="form-card">
+                            <h3>Form Import File</h3>
+                            <form method="POST" enctype="multipart/form-data" id="form-import-excel">
+                                <input type="hidden" name="form_action" value="import_excel">
+
+                                <?php if ($server_file_exists): ?>
+                                    <div class="server-file-box">
+                                        <div style="font-weight:700; color:#166534; margin-bottom:8px; display:flex; align-items:center; gap:6px;">
+                                            <span>📂</span> File Master Terdeteksi di Server
+                                        </div>
+                                        <div style="font-size:13px; color:#374151; line-height:1.5; margin-bottom:12px;">
+                                            Ditemukan file <strong>A. KELAS X 2026-2027.xlsx</strong> (<?php echo count($server_rosters); ?> kelas terdeteksi). Anda dapat langsung mengimpor dari file server ini tanpa perlu upload ulang.
+                                        </div>
+                                        <div style="display:flex; flex-direction:column; gap:8px; font-size:14px;">
+                                            <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                                                <input type="radio" name="source_type" value="server_file" checked onchange="toggleSourceType()">
+                                                <strong>Gunakan File di Server (A. KELAS X 2026-2027.xlsx)</strong>
+                                            </label>
+                                            <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                                                <input type="radio" name="source_type" value="upload" onchange="toggleSourceType()">
+                                                Upload File Baru dari Komputer (.xlsx / .csv)
+                                            </label>
+                                        </div>
+                                    </div>
+                                <?php else: ?>
+                                    <input type="hidden" name="source_type" value="upload">
+                                <?php endif; ?>
+
+                                <div class="form-group" id="upload-file-wrapper" style="<?php echo $server_file_exists ? 'display:none;' : ''; ?>">
+                                    <label>Pilih File Excel (.xlsx) atau CSV</label>
+                                    <div class="upload-dropzone" id="dropzone" onclick="document.getElementById('excel_file').click()">
+                                        <div class="upload-icon">
+                                            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="12" y1="18" x2="12" y2="12"></line><line x1="9" y1="15" x2="15" y2="15"></line></svg>
+                                        </div>
+                                        <div style="font-weight:600; font-size:15px; margin-bottom:4px;" id="file-label-text">
+                                            Klik untuk memilih file atau seret file ke sini
+                                        </div>
+                                        <div style="font-size:12px; color:#64748b;">Mendukung file .xlsx (Excel) atau .csv (Maksimal 10MB)</div>
+                                        <input type="file" id="excel_file" name="excel_file" accept=".xlsx, .csv, .xls" onchange="handleFileSelect(this)">
+                                    </div>
+                                </div>
+
+                                <div class="form-group">
+                                    <label for="import_mode">Format Struktur File</label>
+                                    <select id="import_mode" name="import_mode" required onchange="toggleModeHelp()">
+                                        <option value="school_format" selected>Format Presensi / Buku Roster SMKN 3 (Otomatis Deteksi Kelas, Wali & Siswa)</option>
+                                        <option value="standard_format">Format Tabel Standar (Kolom: Nama, NISN, Kelas, Jurusan, dll.)</option>
+                                    </select>
+                                    <div class="help-text" id="mode-help">
+                                        Membaca file roster sekolah seperti <code>A. KELAS X 2026-2027.xlsx</code>. Sistem otomatis mengekstrak nama kelas, jurusan, wali kelas, dan siswa.
+                                    </div>
+                                </div>
+
+                                <div class="form-group" id="sheet-target-wrapper">
+                                    <label for="target_sheet">Pilihan Sheet yang Diimpor</label>
+                                    <select id="target_sheet" name="target_sheet">
+                                        <option value="all">⚡ Import Semua Sheet Kelas (Semua Roster Terdeteksi)</option>
+                                        <?php if (!empty($server_rosters)): ?>
+                                            <optgroup label="Sheet Terdeteksi di File Server:">
+                                                <?php foreach ($server_rosters as $sName => $rMeta): ?>
+                                                    <option value="<?php echo esc($sName); ?>" <?php echo $sName === 'X PH 1' ? 'selected' : ''; ?>>
+                                                        <?php echo esc($sName); ?> - <?php echo esc($rMeta['class_name']); ?> (<?php echo $rMeta['student_count']; ?> siswa)
+                                                    </option>
+                                                <?php endforeach; ?>
+                                            </optgroup>
+                                        <?php endif; ?>
+                                    </select>
+                                    <div class="help-text">Pilih "Semua Sheet" untuk mengimpor seluruh kelas, atau pilih sheet spesifik seperti <strong>X PH 1 (X PERHOTELAN 1)</strong>.</div>
+                                </div>
+
+                                <div class="action-row" style="margin-top:20px;">
+                                    <button type="submit" class="btn btn-primary" style="display:inline-flex; align-items:center; gap:8px;">
+                                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                                        Mulai Import Data
+                                    </button>
+                                    <a class="btn btn-secondary" href="?action=download_template" style="text-decoration:none; display:inline-flex; align-items:center; gap:6px;">
+                                        Unduh Template CSV
+                                    </a>
+                                </div>
+                            </form>
+                        </div>
+
+                        <div class="table-card">
+                            <h3>Panduan Format File Excel</h3>
+                            <div style="font-size:14px; line-height:1.7; color:#334155;">
+                                <p style="margin-bottom:12px;">Fitur import ini mendukung 2 jenis struktur file:</p>
+
+                                <div style="background:#f8fafc; border-left:4px solid #2563eb; padding:12px 14px; border-radius:6px; margin-bottom:14px;">
+                                    <strong style="color:#1e40af;">1. Format Buku Nilai / Presensi SMKN 3 (Roster Resmi)</strong>
+                                    <ul style="margin:8px 0 0 18px; font-size:13px; color:#475569;">
+                                        <li>File Excel dengan satu atau banyak sheet (seperti <code>A. KELAS X 2026-2027.xlsx</code>).</li>
+                                        <li>Memiliki nama kelas di atas (cth: <code>X PERHOTELAN 1</code>).</li>
+                                        <li>Memiliki baris <code>WALI KELAS : [Nama Guru]</code>.</li>
+                                        <li>Tabel siswa dengan kolom <code>NO</code>, <code>NIPD</code>, <code>NAMA</code>, <code>L/P</code>.</li>
+                                        <li><strong>Hasil:</strong> Kelas, Akun Guru/Wali Kelas, dan Akun seluruh Siswa otomatis dibuat & disinkronkan.</li>
+                                    </ul>
+                                </div>
+
+                                <div style="background:#f8fafc; border-left:4px solid #10b981; padding:12px 14px; border-radius:6px; margin-bottom:14px;">
+                                    <strong style="color:#065f46;">2. Format Tabel Kolom Standar (Excel / CSV)</strong>
+                                    <p style="font-size:13px; color:#475569; margin-top:6px;">Baris pertama harus berupa header kolom:</p>
+                                    <code style="display:block; background:#fff; border:1px solid #e2e8f0; padding:8px 10px; border-radius:6px; font-size:12px; margin-top:6px; color:#0f172a;">
+                                        Nama, NISN_NIP, Kelas, Jurusan, Jabatan, Email, Password, Wali_Kelas
+                                    </code>
+                                </div>
+
+                                <div style="background:#fffbeb; border:1px solid #fde68a; border-radius:10px; padding:12px; font-size:13px; color:#92400e;">
+                                    <strong>💡 Ketentuan Akun Otomatis:</strong>
+                                    <ul style="margin:4px 0 0 16px;">
+                                        <li>Password Siswa otomatis disetel: <code>siswa123</code>.</li>
+                                        <li>Password Guru / Wali Kelas otomatis disetel: <code>guru123</code>.</li>
+                                        <li>Email siswa otomatis digenerate dari nama lengkap jika tidak diisi.</li>
+                                    </ul>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
         </main>
     </div>
 
@@ -1728,6 +2074,75 @@ function pagination_url(string $page, string $param, int $pg_num): string {
             const tingkatSelect = document.getElementById('kelas-tingkat');
             if (tingkatSelect && tingkatSelect.value !== '' && editKelasId === 0) {
                 generateNamaKelas();
+            }
+        });
+
+        // Helper fungsi untuk halaman import excel
+        function toggleSourceType() {
+            const serverRadio = document.querySelector('input[name="source_type"][value="server_file"]');
+            const uploadWrapper = document.getElementById('upload-file-wrapper');
+            const fileInput = document.getElementById('excel_file');
+            if (serverRadio && serverRadio.checked) {
+                if (uploadWrapper) uploadWrapper.style.display = 'none';
+                if (fileInput) fileInput.required = false;
+            } else {
+                if (uploadWrapper) uploadWrapper.style.display = 'block';
+                if (fileInput) fileInput.required = true;
+            }
+        }
+
+        function handleFileSelect(input) {
+            const labelText = document.getElementById('file-label-text');
+            if (input.files && input.files[0]) {
+                const file = input.files[0];
+                labelText.innerHTML = `📄 <strong>${file.name}</strong> (${(file.size / 1024).toFixed(1)} KB)`;
+            }
+        }
+
+        function toggleModeHelp() {
+            const modeSelect = document.getElementById('import_mode');
+            const helpText = document.getElementById('mode-help');
+            const sheetWrapper = document.getElementById('sheet-target-wrapper');
+            if (!modeSelect || !helpText) return;
+
+            if (modeSelect.value === 'standard_format') {
+                helpText.innerHTML = 'Membaca format tabel standar kolom (Nama, NISN, Kelas, Jurusan, Jabatan, dll). Kolom header wajib ada di baris pertama.';
+                if (sheetWrapper) sheetWrapper.style.display = 'none';
+            } else {
+                helpText.innerHTML = 'Membaca file roster sekolah seperti <code>A. KELAS X 2026-2027.xlsx</code>. Sistem otomatis mengekstrak nama kelas, jurusan, wali kelas, dan siswa.';
+                if (sheetWrapper) sheetWrapper.style.display = 'block';
+            }
+        }
+
+        // Drag and drop event listeners
+        document.addEventListener('DOMContentLoaded', function() {
+            const dropzone = document.getElementById('dropzone');
+            if (dropzone) {
+                ['dragenter', 'dragover'].forEach(eventName => {
+                    dropzone.addEventListener(eventName, (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        dropzone.classList.add('dragover');
+                    }, false);
+                });
+
+                ['dragleave', 'drop'].forEach(eventName => {
+                    dropzone.addEventListener(eventName, (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        dropzone.classList.remove('dragover');
+                    }, false);
+                });
+
+                dropzone.addEventListener('drop', (e) => {
+                    const dt = e.dataTransfer;
+                    const files = dt.files;
+                    const fileInput = document.getElementById('excel_file');
+                    if (files && files.length > 0) {
+                        fileInput.files = files;
+                        handleFileSelect(fileInput);
+                    }
+                }, false);
             }
         });
     </script>
